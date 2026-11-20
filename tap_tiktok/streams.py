@@ -1,17 +1,14 @@
 """Stream type classes for tap-tiktok."""
-import copy
 import json
 import datetime
 from dateutil import parser as dateutil_parser
 import requests
 from typing import Any, Dict, Iterable, Optional
-from urllib.parse import urlparse
-from urllib.parse import parse_qs
 
 from singer_sdk.helpers.jsonpath import extract_jsonpath
 from singer_sdk import typing as th  # JSON Schema typing helpers
 
-from tap_tiktok.client import TikTokStream
+from tap_tiktok.client import PAGE_SIZE, TikTokStream
 from tap_tiktok.client import TikTokReportsStream
 
 
@@ -256,57 +253,75 @@ CAMPAIGN_METRICS_BASE_PROPERTIES = [
 
 
 class AdsMetricsByDayStream(TikTokReportsStream):
-    tiktok_metrics = []
+    """A daily report (report/integrated/get, BASIC), one advertiser per partition.
+
+    Each run asks for every day from the stream's start to its end, in windows of at most
+    STEP_NUM_DAYS + 1 days, every page of each window. The start is the bookmark less `lookback`
+    days (TikTok restates conversions inside its attribution windows), never before
+    `start_date`; the end is `end_date`, else today (UTC). So a run returns every (ad, day) row
+    TikTok has for the advertiser over a contiguous range, and a loader can replace that range.
+
+    A stream whose metrics TikTok won't take in one request (`metric_chunks`) asks once per
+    chunk and joins the rows of a window by their dimensions before yielding them.
+    """
+
+    tiktok_metrics: list = []
+    # None: one request per page with tiktok_metrics. Else: one per chunk of metrics.
+    metric_chunks: Optional[list] = None
     data_level = "AUCTION_AD"
     dimensions = ["ad_id", "stat_time_day"]
 
     status_field = "ad_status"
 
+    def _range(self, context: Optional[dict]) -> "tuple[datetime.date, datetime.date]":
+        """The first and last day this run asks TikTok for, for this advertiser."""
+        utc = datetime.timezone.utc
+        today = datetime.datetime.now(tz=utc).date()
+        config_start = dateutil_parser.isoparse(self.config["start_date"])
+        if config_start.tzinfo is None:
+            config_start = config_start.replace(tzinfo=utc)
+        start = self.get_starting_timestamp(context) or config_start
+        if start.tzinfo is None:
+            start = start.replace(tzinfo=utc)
+        lookback = int(self.config.get("lookback", 14) or 0)
+        if lookback > 0:
+            # Re-pull the lookback window (TikTok restates recent days), never before start_date.
+            start = max(min(start, datetime.datetime.now(tz=utc) - datetime.timedelta(days=lookback)), config_start)
+        end = today
+        if self.config.get("end_date"):
+            end = min(dateutil_parser.isoparse(self.config["end_date"]).date(), today)
+        return start.date(), end
+
+    @staticmethod
+    def windows(start: datetime.date, end: datetime.date) -> "list[tuple[datetime.date, datetime.date]]":
+        """[start, end] cut into windows of at most STEP_NUM_DAYS + 1 days (TikTok's limit for
+        daily reports is a 30 day span), contiguous and in order."""
+        out = []
+        while start <= end:
+            last = min(start + datetime.timedelta(days=STEP_NUM_DAYS), end)
+            out.append((start, last))
+            start = last + datetime.timedelta(days=1)
+        return out
+
     def get_url_params(
         self, context: Optional[dict], next_page_token: Optional[Any]
     ) -> Dict[str, Any]:
-        """Return a dictionary of values to be used in URL parameterization."""
-        if isinstance(next_page_token, dict) and next_page_token["start_date"] is not None:
-            start_date = datetime.datetime.strptime(next_page_token["start_date"], DATE_FORMAT)
-        else:
-            start_date = self.get_starting_timestamp(context)
-
-            # picking up where we left off on the last run (or first run), adjust for lookback if set
-            lookback_window = self.config.get("lookback", 14)
-            if lookback_window > 0:
-                # if lookback is configured, we want to refetch data for the entire lookback window
-                # (or as far back as the configured start date, whichever is the most recent date)
-                # Ensure start_date has timezone info
-                if start_date.tzinfo is None:
-                    start_date = start_date.replace(tzinfo=datetime.timezone.utc)
-                
-                # Parse config start_date and ensure it has timezone info
-                config_start_date = dateutil_parser.isoparse(self.config["start_date"])
-                if config_start_date.tzinfo is None:
-                    config_start_date = config_start_date.replace(tzinfo=datetime.timezone.utc)
-                
-                start_date = max(
-                    min(start_date, datetime.datetime.now(tz=start_date.tzinfo) - datetime.timedelta(days=lookback_window)),
-                    config_start_date,
-                )
-
-        # Ensure start_date has timezone info for consistent datetime operations
-        if start_date.tzinfo is None:
-            start_date = start_date.replace(tzinfo=datetime.timezone.utc)
-            
-        yesterday = datetime.datetime.now(tz=start_date.tzinfo) - datetime.timedelta(days=1)
-        today = datetime.datetime.now(tz=start_date.tzinfo)
-        end_date = min(start_date + datetime.timedelta(days=STEP_NUM_DAYS), today)
+        """One page of one window: next_page_token is {"start_date", "end_date", "page", "metrics"}."""
+        token = next_page_token or {}
+        if not token.get("start_date"):
+            start, end = self._range(context)
+            token = {"start_date": start.strftime(DATE_FORMAT), "end_date": end.strftime(DATE_FORMAT), **token}
         params: dict = {
-            "page_size": 10,
+            "page_size": PAGE_SIZE,
+            "page": token.get("page") or 1,
             "advertiser_id": self._advertiser_id_for(context),
             "service_type": "AUCTION",
             "report_type": "BASIC",
             "data_level": self.data_level,
             "dimensions": json.dumps(self.dimensions),
-            "metrics": json.dumps(self.tiktok_metrics),
-            "start_date": start_date.strftime(DATE_FORMAT),
-            "end_date": end_date.strftime(DATE_FORMAT),
+            "metrics": json.dumps(token.get("metrics") or self.tiktok_metrics),
+            "start_date": token["start_date"],
+            "end_date": token["end_date"],
             "filtering": json.dumps([
                 {
                     'field_name': self.status_field,
@@ -315,9 +330,6 @@ class AdsMetricsByDayStream(TikTokReportsStream):
                 }
             ])
         }
-        if next_page_token:
-            params["page"] = next_page_token["page"]
-        
         return params
 
     @staticmethod
@@ -325,64 +337,53 @@ class AdsMetricsByDayStream(TikTokReportsStream):
         page_matches = extract_jsonpath(json_path, json)
         return next(iter(page_matches), None)
 
-    def get_next_page_token(
-        self, response: requests.Response, previous_token: Optional[Any]
-    ) -> Optional[Any]:
-        """Return a token for identifying next page or None if no more pages."""
-        current_page = self._get_page_info("$.data.page_info.page", response.json()) or 0
-        total_pages = self._get_page_info("$.data.page_info.total_page", response.json()) or 0
-        start_date = datetime.datetime.strptime(parse_qs(urlparse(response.request.url).query)['start_date'][0],DATE_FORMAT)
-        
-        # Ensure start_date has timezone info
-        if start_date.tzinfo is None:
-            start_date = start_date.replace(tzinfo=datetime.timezone.utc)
-            
-        yesterday = datetime.datetime.now(tz=start_date.tzinfo) - datetime.timedelta(days=1)
-        end_date = datetime.datetime.strptime(parse_qs(urlparse(response.request.url).query)['end_date'][0], DATE_FORMAT)
-        
-        # Ensure end_date has timezone info to match yesterday
-        if end_date.tzinfo is None:
-            end_date = end_date.replace(tzinfo=datetime.timezone.utc)
-        if current_page < total_pages:
-            return {
-                "page": current_page + 1,
-                "start_date": previous_token["start_date"] if previous_token else None
-            }
-        elif end_date.date() < yesterday.date():
-            return {
-                "page": 1,
-                "start_date": min(end_date + datetime.timedelta(days=1), yesterday).strftime(DATE_FORMAT)
-            }
-        return None
+    def _pages(self, context: Optional[dict], decorated_request, token: dict) -> Iterable[dict]:
+        """Every row of one window (and metric chunk), page by page."""
+        page = 1
+        while True:
+            prepared_request = self.prepare_request(context, next_page_token={**token, "page": page})
+            resp = decorated_request(prepared_request, context)
+            yield from self.parse_response(resp)
+            body = resp.json()
+            total_pages = self._get_page_info("$.data.page_info.total_page", body) or 0
+            if page >= total_pages:
+                return
+            page += 1
 
     def request_records(self, context: Optional[dict]) -> Iterable[dict]:
-        """Request records, advancing through date windows even when a window returns 0 records.
-
-        The default Singer SDK RESTStream stops pagination when the last response has no
-        records. TikTok often returns empty for early date windows; we must keep advancing
-        (start_date/end_date) until we've covered the range or get_next_page_token returns None.
-        """
-        next_page_token: Any = None
-        finished = False
+        """Every window from the run's start to its end, every page of each: a window that
+        returns no rows does not end the stream (the SDK's default stops at an empty page)."""
+        start, end = self._range(context)
+        advertiser = self._advertiser_id_for(context)
         decorated_request = self.request_decorator(self._request)
-
-        while not finished:
-            prepared_request = self.prepare_request(
-                context, next_page_token=next_page_token
+        chunks = self.metric_chunks or [self.tiktok_metrics]
+        total = 0
+        for window_start, window_end in self.windows(start, end):
+            token = {"start_date": window_start.strftime(DATE_FORMAT), "end_date": window_end.strftime(DATE_FORMAT)}
+            count = 0
+            if len(chunks) == 1:
+                for row in self._pages(context, decorated_request, {**token, "metrics": chunks[0]}):
+                    count += 1
+                    yield row
+            else:
+                rows: dict = {}
+                for metrics in chunks:
+                    for row in self._pages(context, decorated_request, {**token, "metrics": metrics}):
+                        key = tuple(row["dimensions"][name] for name in self.dimensions)
+                        if key in rows:
+                            rows[key]["metrics"] = {**rows[key]["metrics"], **row["metrics"]}
+                        else:
+                            rows[key] = row
+                count = len(rows)
+                yield from rows.values()
+            total += count
+            self.logger.info(
+                "tiktok: %s advertiser %s %s..%s: %s rows", self.name, advertiser, token["start_date"], token["end_date"], count
             )
-            resp = decorated_request(prepared_request, context)
-            for row in self.parse_response(resp):
-                yield row
-            previous_token = copy.deepcopy(next_page_token)
-            next_page_token = self.get_next_page_token(
-                response=resp, previous_token=previous_token
-            )
-            if next_page_token and next_page_token == previous_token:
-                raise RuntimeError(
-                    "Loop detected in pagination. "
-                    "Pagination token is identical to prior token."
-                )
-            finished = not next_page_token
+        self.logger.info(
+            "tiktok: %s advertiser %s done, %s..%s (lookback %s days): %s rows",
+            self.name, advertiser, start, end, self.config.get("lookback", 14), total,
+        )
 
 
 class CampaignMetricsByDayStream(AdsMetricsByDayStream):
@@ -408,13 +409,15 @@ class AdsAttributeMetricsStream(AdsMetricsByDayStream):
     ]
     properties += [th.Property(metric, th.StringType if metric in ["campaign_id", "adgroup_id"] else th.StringType) for metric in ATTRIBUTE_METRICS]
     schema = th.PropertiesList(*properties).to_dict()
+    # One request per page (no date windows): the SDK's own paging.
+    request_records = TikTokReportsStream.request_records
 
     def get_url_params(
         self, context: Optional[dict], next_page_token: Optional[Any]
     ) -> Dict[str, Any]:
         """Return a dictionary of values to be used in URL parameterization."""
         params: dict = {
-            "page_size": 10,
+            "page_size": PAGE_SIZE,
             "advertiser_id": self._advertiser_id_for(context),
             "service_type": "AUCTION",
             "report_type": "BASIC",
@@ -450,13 +453,15 @@ class CampaignsAttributeMetricsStream(CampaignMetricsByDayStream):
     ]
     properties += [th.Property(metric, th.StringType if metric in ["campaign_id", "adgroup_id"] else th.StringType) for metric in ATTRIBUTE_METRICS]
     schema = th.PropertiesList(*properties).to_dict()
+    # One request per page (no date windows): the SDK's own paging.
+    request_records = TikTokReportsStream.request_records
 
     def get_url_params(
         self, context: Optional[dict], next_page_token: Optional[Any]
     ) -> Dict[str, Any]:
         """Return a dictionary of values to be used in URL parameterization."""
         params: dict = {
-            "page_size": 10,
+            "page_size": PAGE_SIZE,
             "advertiser_id": self._advertiser_id_for(context),
             "service_type": "AUCTION",
             "report_type": "BASIC",
@@ -679,87 +684,25 @@ IN_APP_EVENT_METRICS = [
 class AdsInAppEventMetricsByDayStream(AdsMetricsByDayStream):
     name = "ads_in_app_event_metrics_by_day"
     path = "/"
+    tiktok_metrics = IN_APP_EVENT_METRICS
+    # TikTok refuses all 174 in one request: two halves, joined per (id, day).
+    metric_chunks = [IN_APP_EVENT_METRICS[: len(IN_APP_EVENT_METRICS) // 2], IN_APP_EVENT_METRICS[len(IN_APP_EVENT_METRICS) // 2 :]]
     primary_keys = ["advertiser_id", "ad_id", "stat_time_day"]
     replication_key = "stat_time_day"
     properties = list(AD_METRICS_BASE_PROPERTIES)
     properties += [th.Property(metric, th.StringType) for metric in IN_APP_EVENT_METRICS]
     schema = th.PropertiesList(*properties).to_dict()
 
-    def request_records(self, context: Optional[dict]) -> Iterable[dict]:
-        next_page_token: Any = None
-        finished = False
-        decorated_request = self.request_decorator(self._request)
-
-        while not finished:
-            rows = {}
-            for i in range(2):
-                chunk_size = len(IN_APP_EVENT_METRICS) // 2
-                self.tiktok_metrics = IN_APP_EVENT_METRICS[chunk_size * i: (i + 1) * chunk_size]
-                prepared_request = self.prepare_request(
-                    context, next_page_token=next_page_token
-                )
-                resp = decorated_request(prepared_request, context)
-                for row in self.parse_response(resp):
-                    primary_key = tuple(row["dimensions"][key] for key in self.dimensions)
-                    if rows.get(primary_key) is None:
-                        rows[primary_key] = row
-                    else:
-                        rows[primary_key]['metrics'] = {**row['metrics'], **rows[primary_key]['metrics']}
-            for row in rows.values():
-                yield row
-            previous_token = copy.deepcopy(next_page_token)
-            next_page_token = self.get_next_page_token(
-                response=resp, previous_token=previous_token
-            )
-            if next_page_token and next_page_token == previous_token:
-                raise RuntimeError(
-                    f"Loop detected in pagination. "
-                    f"Pagination token {next_page_token} is identical to prior token."
-                )
-            # Cycle until get_next_page_token() no longer returns a value
-            finished = not next_page_token
-
 
 class CampaignsInAppEventMetricsByDayStream(CampaignMetricsByDayStream):
     name = "campaigns_in_app_event_metrics_by_day"
     status_field = "campaign_status"
     path = "/"
+    tiktok_metrics = IN_APP_EVENT_METRICS
+    # TikTok refuses all 174 in one request: two halves, joined per (id, day).
+    metric_chunks = [IN_APP_EVENT_METRICS[: len(IN_APP_EVENT_METRICS) // 2], IN_APP_EVENT_METRICS[len(IN_APP_EVENT_METRICS) // 2 :]]
     primary_keys = ["advertiser_id", "campaign_id", "stat_time_day"]
     replication_key = "stat_time_day"
     properties = list(CAMPAIGN_METRICS_BASE_PROPERTIES)
     properties += [th.Property(metric, th.StringType) for metric in IN_APP_EVENT_METRICS]
     schema = th.PropertiesList(*properties).to_dict()
-
-    def request_records(self, context: Optional[dict]) -> Iterable[dict]:
-        next_page_token: Any = None
-        finished = False
-        decorated_request = self.request_decorator(self._request)
-
-        while not finished:
-            rows = {}
-            for i in range(2):
-                chunk_size = len(IN_APP_EVENT_METRICS) // 2
-                self.tiktok_metrics = IN_APP_EVENT_METRICS[chunk_size * i: (i + 1) * chunk_size]
-                prepared_request = self.prepare_request(
-                    context, next_page_token=next_page_token
-                )
-                resp = decorated_request(prepared_request, context)
-                for row in self.parse_response(resp):
-                    primary_key = tuple(row["dimensions"][key] for key in self.dimensions)
-                    if rows.get(primary_key) is None:
-                        rows[primary_key] = row
-                    else:
-                        rows[primary_key]['metrics'] = {**row['metrics'], **rows[primary_key]['metrics']}
-            for row in rows.values():
-                yield row
-            previous_token = copy.deepcopy(next_page_token)
-            next_page_token = self.get_next_page_token(
-                response=resp, previous_token=previous_token
-            )
-            if next_page_token and next_page_token == previous_token:
-                raise RuntimeError(
-                    f"Loop detected in pagination. "
-                    f"Pagination token {next_page_token} is identical to prior token."
-                )
-            # Cycle until get_next_page_token() no longer returns a value
-            finished = not next_page_token

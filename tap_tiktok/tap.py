@@ -85,6 +85,11 @@ class TapTikTok(Tap):
             description="The earliest record date to sync"
         ),
         th.Property(
+            "end_date",
+            th.DateTimeType,
+            description="The last day of the daily reports to sync (default: today, UTC). For re-pulls of a past range."
+        ),
+        th.Property(
             "include_deleted",
             th.BooleanType,
             default=True,
@@ -94,7 +99,7 @@ class TapTikTok(Tap):
             "lookback",
             th.IntegerType,
             default=14,
-            description="The number of days of data to reload from the current date (ignored if current state of the extractor has a start date earlier than the current date minus number of lookback days)"
+            description="The number of days of daily report data to pull again on every run, counted back from today, because TikTok restates recent days (late conversions inside its attribution windows). Ignored when the bookmark is already earlier; never before start_date."
         )
     ).to_dict()
 
